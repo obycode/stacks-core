@@ -1,21 +1,41 @@
-use std::collections::BTreeMap;
+// Copyright (C) 2025 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#[cfg(feature = "rusqlite")]
+mod rusqlite_support {
+    use std::collections::BTreeMap;
+
+    use stacks_common::consts::CHAIN_ID_TESTNET;
+
+    use crate::vm::analysis::{mem_type_check, ContractAnalysis};
+    use crate::vm::ast::{build_ast_with_rules, ASTRules};
+    use crate::vm::contexts::GlobalContext;
+    use crate::vm::costs::LimitedCostTracker;
+    use crate::vm::database::MemoryBackingStore;
+    use crate::vm::types::{QualifiedContractIdentifier, Value};
+    use crate::vm::version::ClarityVersion;
+    use crate::vm::{self, ContractContext};
+}
 
 use hashbrown::{HashMap, HashSet};
-use stacks_common::consts::CHAIN_ID_TESTNET;
+#[cfg(feature = "rusqlite")]
+use rusqlite_support::*;
 use stacks_common::types::StacksEpochId;
 
-#[cfg(feature = "rusqlite")]
-use crate::vm::analysis::mem_type_check;
-use crate::vm::analysis::ContractAnalysis;
-use crate::vm::ast::{build_ast_with_rules, ASTRules};
-use crate::vm::contexts::GlobalContext;
-use crate::vm::costs::LimitedCostTracker;
-#[cfg(feature = "rusqlite")]
-use crate::vm::database::MemoryBackingStore;
 use crate::vm::docs::{get_input_type_string, get_output_type_string, get_signature};
-use crate::vm::types::{FunctionType, QualifiedContractIdentifier, Value};
-use crate::vm::version::ClarityVersion;
-use crate::vm::{self, ContractContext};
+use crate::vm::types::FunctionType;
 
 const DOCS_GENERATION_EPOCH: StacksEpochId = StacksEpochId::Epoch2_05;
 
