@@ -374,7 +374,19 @@ impl SortitionData {
                 }
             }
         }
-        Ok(tip.height() < block.header.chain_length)
+
+        let is_higher_than_tip = block.header.chain_length > tip.height();
+        if !is_higher_than_tip {
+            info!(
+                "Miner's block proposal does not confirm as many blocks as we expect";
+                "proposed_block_consensus_hash" => %block.header.consensus_hash,
+                "signer_signature_hash" => %block.header.signer_signature_hash(),
+                "proposed_chain_length" => block.header.chain_length,
+                "expected_at_least" => tip.height() + 1,
+                "tip_hash" => %tip.block_hash(),
+            );
+        }
+        Ok(is_higher_than_tip)
     }
 
     /// Check if the tenure change block confirms the expected parent block
