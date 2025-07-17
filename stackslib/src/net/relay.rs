@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::mem;
 
 use clarity::vm::ast::errors::ParseErrors;
@@ -114,6 +114,10 @@ pub struct Relayer {
     /// Maps to tenure ID and timestamp, so we can garbage-collect.
     /// Timestamp is in milliseconds
     recently_sent_nakamoto_blocks: HashMap<StacksBlockId, (ConsensusHash, u128)>,
+    /// Recently-sent StackerDB chunks, so we don't keep re-sending them.
+    /// Maps (contract ID, slot ID) to the active signer and the 5 most recent
+    /// slot versions that we sent.
+    recently_sent_stacker_db_chunks: StackerDBChunkTracker,
 }
 
 #[derive(Debug)]
@@ -578,6 +582,7 @@ impl Relayer {
             connection_opts,
             stacker_dbs,
             recently_sent_nakamoto_blocks: HashMap::new(),
+            recently_sent_stacker_db_chunks: StackerDBChunkTracker::new(),
         }
     }
 
@@ -2496,17 +2501,11 @@ impl Relayer {
                 let tx = self.stacker_dbs.tx_begin(config.clone())?;
                 for sync_result in sync_results.into_iter() {
                     for chunk in sync_result.chunks_to_store.into_iter() {
-                        if let Some(event_list) = all_events.get_mut(&sync_result.contract_id) {
-                            event_list.push(chunk.clone());
-                        } else {
-                            all_events.insert(sync_result.contract_id.clone(), vec![chunk.clone()]);
-                        }
-
                         let md = chunk.get_slot_metadata();
-                        if let Err(e) = tx.try_replace_chunk(&sc, &md, &chunk.data) {
-                            if matches!(e, Error::StaleChunk { .. }) {
-                                // This is a common and expected message, so log it as a debug and with a sep message
-                                // to distinguish it from other message types.
+                        let (msg_signer, store) = match tx.try_replace_chunk(&sc, &md, &chunk.data)
+                        {
+                            Ok(signer) => (Some(signer), true),
+                            Err(e @ Error::StaleChunk { signer, .. }) => {
                                 debug!(
                                     "Dropping stale StackerDB chunk";
                                     "stackerdb_contract_id" => %sync_result.contract_id,
@@ -2515,7 +2514,9 @@ impl Relayer {
                                     "num_bytes" => chunk.data.len(),
                                     "error" => %e
                                 );
-                            } else {
+                                (Some(signer), false)
+                            }
+                            Err(e) => {
                                 warn!(
                                     "Failed to store chunk for StackerDB";
                                     "stackerdb_contract_id" => %sync_result.contract_id,
@@ -2524,11 +2525,31 @@ impl Relayer {
                                     "num_bytes" => chunk.data.len(),
                                     "error" => %e
                                 );
+                                (None, false)
                             }
-                            continue;
-                        } else {
-                            debug!("Stored chunk"; "stackerdb_contract_id" => %sync_result.contract_id, "slot_id" => md.slot_id, "slot_version" => md.slot_version);
+                        };
+
+                        if let Some(signer) = msg_signer {
+                            self.recently_sent_stacker_db_chunks.set_slot_signer(
+                                &sc,
+                                chunk.slot_id,
+                                signer,
+                            );
+
+                            if let Some(event_list) = all_events.get_mut(&sync_result.contract_id) {
+                                event_list.push(chunk.clone());
+                            } else {
+                                all_events
+                                    .insert(sync_result.contract_id.clone(), vec![chunk.clone()]);
+                            }
                         }
+
+                        // if we didn't store it, then we don't need to broadcast it
+                        if !store {
+                            continue;
+                        }
+
+                        debug!("Stored chunk"; "stackerdb_contract_id" => %sync_result.contract_id, "slot_id" => md.slot_id, "slot_version" => md.slot_version);
 
                         let msg = StacksMessageType::StackerDBPushChunk(StackerDBPushChunkData {
                             contract_id: sc.clone(),
@@ -2547,8 +2568,20 @@ impl Relayer {
         }
 
         if let Some(observer) = event_observer.as_ref() {
-            for (contract_id, new_chunks) in all_events.into_iter() {
-                observer.new_stackerdb_chunks(contract_id, new_chunks);
+            // filter out recently sent chunks
+            let filtered = all_events.into_iter().map(|(contract_id, mut chunks)| {
+                chunks.retain(|chunk| {
+                    self.should_send_stackerdb_chunk_event(
+                        &contract_id,
+                        chunk.slot_id,
+                        chunk.slot_version,
+                    )
+                });
+                (contract_id, chunks)
+            });
+
+            for (contract_id, chunks) in filtered {
+                observer.new_stackerdb_chunks(contract_id, chunks);
             }
         }
         Ok(())
@@ -3035,6 +3068,17 @@ impl Relayer {
 
         Ok(receipts)
     }
+
+    /// Check if a stackerdb chunk should be sent to event observers.
+    fn should_send_stackerdb_chunk_event(
+        &mut self,
+        sc: &QualifiedContractIdentifier,
+        slot_id: u32,
+        slot_version: u32,
+    ) -> bool {
+        self.recently_sent_stacker_db_chunks
+            .track_chunk(sc, slot_id, slot_version)
+    }
 }
 
 impl PeerNetwork {
@@ -3461,5 +3505,278 @@ impl PeerNetwork {
                 self.relayer_stats.add_relayed_message((*nk).clone(), tx);
             }
         }
+    }
+}
+
+/// An ordered set of the top 5 most recently sent StackerDB slot versions.
+#[derive(Debug)]
+struct Top5(BTreeSet<u32>);
+
+impl Top5 {
+    fn new() -> Self {
+        Top5(BTreeSet::new())
+    }
+
+    fn reset(&mut self) {
+        self.0.clear();
+    }
+
+    /// Add a new slot version, if it is within 5 of the most recent version.
+    /// Returns true if the slot version was added, false if not.
+    fn add(&mut self, slot_version: u32) -> bool {
+        // If this version is not within 5 of the most recent, do not insert.
+        let max = self.0.last();
+        if let Some(max) = max {
+            if slot_version <= max.saturating_sub(5) {
+                return false;
+            }
+        }
+
+        // Insert and remove the oldest if we exceed 5.
+        if self.0.insert(slot_version) {
+            if self.0.len() > 5 {
+                self.0.pop_first();
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Key for StackerDBChunkTracker: uniquely identifies a slot in a contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StackerDBSlotKey {
+    contract_id: QualifiedContractIdentifier,
+    slot_id: u32,
+}
+
+/// Value for StackerDBChunkTracker: stores the signer and the top 5 most recent slot versions.
+#[derive(Debug)]
+struct StackerDBSlotInfo {
+    signer: StacksAddress,
+    top5: Top5,
+}
+
+/// A tracker for StackerDB chunks, which keeps track of the signer and the top
+/// 5 most recent slot versions. The signer for a slot must be set with
+/// `set_slot_signer` before tracking chunks for that slot.
+struct StackerDBChunkTracker(HashMap<StackerDBSlotKey, StackerDBSlotInfo>);
+
+impl StackerDBChunkTracker {
+    fn new() -> Self {
+        StackerDBChunkTracker(HashMap::new())
+    }
+
+    fn set_slot_signer(
+        &mut self,
+        contract_id: &QualifiedContractIdentifier,
+        slot_id: u32,
+        signer: StacksAddress,
+    ) {
+        let key = StackerDBSlotKey {
+            contract_id: contract_id.clone(),
+            slot_id,
+        };
+
+        if let Some(entry) = self.0.get_mut(&key) {
+            // If the signer is different, reset the top5
+            if entry.signer != signer {
+                entry.top5.reset();
+                entry.signer = signer;
+            }
+        } else {
+            // Create a new entry with the signer and a new Top5
+            self.0.insert(
+                key,
+                StackerDBSlotInfo {
+                    signer,
+                    top5: Top5::new(),
+                },
+            );
+        }
+    }
+
+    fn track_chunk(
+        &mut self,
+        sc: &QualifiedContractIdentifier,
+        slot_id: u32,
+        slot_version: u32,
+    ) -> bool {
+        let key = StackerDBSlotKey {
+            contract_id: sc.clone(),
+            slot_id,
+        };
+
+        let Some(slot) = self.0.get_mut(&key) else {
+            // We should always have an entry for the contract and slot because
+            // we create it when we set the signer.
+            warn!("No entry for contract {} slot {}", sc, slot_id);
+            return false;
+        };
+        slot.top5.add(slot_version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_and_order() {
+        let mut top5 = Top5::new();
+        assert!(top5.add(1));
+        assert!(top5.add(2));
+        assert!(top5.add(3));
+        assert!(top5.add(4));
+        assert!(top5.add(5));
+        // Should have 5 elements
+        assert_eq!(top5.0.len(), 5);
+        // Adding 6 should remove 1
+        assert!(top5.add(6));
+        assert_eq!(top5.0.len(), 5);
+        assert!(!top5.0.contains(&1));
+        assert!(top5.0.contains(&6));
+    }
+
+    #[test]
+    fn test_add_duplicate() {
+        let mut top5 = Top5::new();
+        assert!(top5.add(10));
+        assert!(!top5.add(10)); // duplicate, should not add
+        assert_eq!(top5.0.len(), 1);
+    }
+
+    #[test]
+    fn test_add_out_of_range() {
+        let mut top5 = Top5::new();
+        assert!(top5.add(105));
+        // Adding a value more than 5 less than max should not add
+        assert!(!top5.add(99));
+        assert_eq!(top5.0.len(), 1);
+        assert!(!top5.0.contains(&99));
+        assert!(top5.0.contains(&105));
+    }
+
+    #[test]
+    fn test_add_multiple_out_of_order() {
+        let mut top5 = Top5::new();
+        assert!(top5.add(52));
+        assert!(top5.add(50));
+        assert!(top5.add(51));
+        assert!(top5.add(54));
+        assert!(top5.add(53));
+        // Now, adding 49 (more than 5 less than max 54) should not add
+        assert!(!top5.add(49));
+        // Adding 55 should remove 50
+        assert!(top5.add(55));
+        assert_eq!(top5.0.len(), 5);
+        assert!(!top5.0.contains(&50));
+        assert!(top5.0.contains(&55));
+    }
+
+    fn dummy_contract_id() -> QualifiedContractIdentifier {
+        QualifiedContractIdentifier::transient()
+    }
+
+    fn dummy_signer(n: u8) -> StacksAddress {
+        StacksAddress::new_unsafe(1, Hash160::from_bytes(&[n; 20]).unwrap())
+    }
+
+    #[test]
+    fn test_new_tracker_empty() {
+        let tracker = StackerDBChunkTracker::new();
+        assert_eq!(tracker.0.len(), 0);
+    }
+
+    #[test]
+    fn test_set_slot_signer_creates_entry() {
+        let mut tracker = StackerDBChunkTracker::new();
+        let cid = dummy_contract_id();
+        let signer = dummy_signer(1);
+        tracker.set_slot_signer(&cid, 42, signer.clone());
+        let key = StackerDBSlotKey {
+            contract_id: cid.clone(),
+            slot_id: 42,
+        };
+        assert!(tracker.0.contains_key(&key));
+        assert_eq!(tracker.0.get(&key).unwrap().signer, signer);
+    }
+
+    #[test]
+    fn test_set_slot_signer_resets_top5_on_signer_change() {
+        let mut tracker = StackerDBChunkTracker::new();
+        let cid = dummy_contract_id();
+        let signer1 = dummy_signer(1);
+        let signer2 = dummy_signer(2);
+        tracker.set_slot_signer(&cid, 1, signer1.clone());
+        tracker.track_chunk(&cid, 1, 10);
+        tracker.track_chunk(&cid, 1, 11);
+        let key = StackerDBSlotKey {
+            contract_id: cid.clone(),
+            slot_id: 1,
+        };
+        assert_eq!(tracker.0.get(&key).unwrap().top5.0.len(), 2);
+        tracker.set_slot_signer(&cid, 1, signer2.clone());
+        assert_eq!(tracker.0.get(&key).unwrap().signer, signer2);
+        assert_eq!(tracker.0.get(&key).unwrap().top5.0.len(), 0);
+    }
+
+    #[test]
+    fn test_set_slot_signer_same_signer_does_not_reset_top5() {
+        let mut tracker = StackerDBChunkTracker::new();
+        let cid = dummy_contract_id();
+        let signer = dummy_signer(3);
+        tracker.set_slot_signer(&cid, 2, signer.clone());
+        tracker.track_chunk(&cid, 2, 20);
+        tracker.set_slot_signer(&cid, 2, signer.clone());
+        let key = StackerDBSlotKey {
+            contract_id: cid,
+            slot_id: 2,
+        };
+        assert_eq!(tracker.0.get(&key).unwrap().top5.0.len(), 1);
+    }
+
+    #[test]
+    fn test_track_chunk_adds_versions() {
+        let mut tracker = StackerDBChunkTracker::new();
+        let cid = dummy_contract_id();
+        let signer = dummy_signer(4);
+        tracker.set_slot_signer(&cid, 3, signer.clone());
+        assert!(tracker.track_chunk(&cid, 3, 100));
+        assert!(tracker.track_chunk(&cid, 3, 101));
+        let key = StackerDBSlotKey {
+            contract_id: cid,
+            slot_id: 3,
+        };
+        assert_eq!(tracker.0.get(&key).unwrap().top5.0.len(), 2);
+    }
+
+    #[test]
+    fn test_track_chunk_top5_limit() {
+        let mut tracker = StackerDBChunkTracker::new();
+        let cid = dummy_contract_id();
+        let signer = dummy_signer(5);
+        tracker.set_slot_signer(&cid, 4, signer.clone());
+        for v in 200..206 {
+            tracker.track_chunk(&cid, 4, v);
+        }
+        let key = StackerDBSlotKey {
+            contract_id: cid,
+            slot_id: 4,
+        };
+        let top5 = &tracker.0.get(&key).unwrap().top5.0;
+        assert_eq!(top5.len(), 5);
+        assert!(!top5.contains(&200));
+        assert!(top5.contains(&205));
+    }
+
+    #[test]
+    fn test_track_chunk_out_of_range_version() {
+        let mut tracker = StackerDBChunkTracker::new();
+        let cid = dummy_contract_id();
+        let signer = dummy_signer(6);
+        tracker.set_slot_signer(&cid, 5, signer.clone());
+        assert!(tracker.track_chunk(&cid, 5, 300));
+        assert!(!tracker.track_chunk(&cid, 5, 294)); // 294 is more than 5 less than 300
     }
 }
