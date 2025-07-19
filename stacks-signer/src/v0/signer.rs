@@ -132,6 +132,8 @@ pub struct Signer {
     pub tx_replay_scope: ReplayScopeOpt,
     /// Time to wait between updating our local state machine view point and capitulating to other signers miner view
     pub capitulate_miner_view_timeout: Duration,
+    /// The last time we capitulated our miner viewpoint
+    pub last_capitulate_miner_view: SystemTime,
     /// The signer supported protocol version. used only in testing
     #[cfg(any(test, feature = "testing"))]
     pub supported_signer_protocol_version: u64,
@@ -309,6 +311,7 @@ impl SignerTrait<SignerMessage> for Signer {
             validate_with_replay_tx: signer_config.validate_with_replay_tx,
             tx_replay_scope: None,
             capitulate_miner_view_timeout: signer_config.capitulate_miner_view_timeout,
+            last_capitulate_miner_view: SystemTime::now(),
             #[cfg(any(test, feature = "testing"))]
             supported_signer_protocol_version: signer_config.supported_signer_protocol_version,
         }
@@ -348,6 +351,7 @@ impl SignerTrait<SignerMessage> for Signer {
             sortition_state,
             self.capitulate_miner_view_timeout,
             self.proposal_config.tenure_last_block_proposal_timeout,
+            &mut self.last_capitulate_miner_view,
         );
 
         if prior_state != self.local_state_machine {
