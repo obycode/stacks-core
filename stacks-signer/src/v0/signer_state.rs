@@ -373,7 +373,6 @@ impl LocalStateMachine {
         tenure_last_block_proposal_timeout: Duration,
         parent_tenure_id: &ConsensusHash,
     ) -> Result<(u64, StacksBlockId), SignerChainstateError> {
-        info!("get_parent_tenure_last_block");
         let stacks_node_last_block = client
             .get_tenure_tip(parent_tenure_id)
             .inspect_err(|e| {
@@ -657,7 +656,6 @@ impl LocalStateMachine {
         let is_current_valid = cur_sortition.is_tenure_valid(db, client, proposal_config, eval)?;
 
         let miner_state = if is_current_valid {
-            info!("check_miner_inactivity");
             Self::make_miner_state(
                 cur_sortition.data().clone(),
                 client,
@@ -932,7 +930,6 @@ impl LocalStateMachine {
                     if potential_matches.contains(&potential_match) {
                         continue;
                     };
-                    info!("capitulate_miner_view");
                     let Ok((local_parent_tenure_last_block_height, _)) =
                         Self::get_parent_tenure_last_block(
                             stacks_client,
