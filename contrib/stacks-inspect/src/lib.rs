@@ -14,8 +14,10 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use std::{fs, process};
+use std::{fs, process, thread};
 
 use clarity::types::chainstate::SortitionId;
 use clarity::util::hash::{Sha512Trunc256Sum, to_hex};
@@ -103,6 +105,12 @@ impl ReplayProfiler {
     fn record_block(&mut self, timings: ReplayTimings) {
         self.blocks_processed += 1;
         self.block_totals.add_assign(&timings);
+    }
+
+    fn merge(&mut self, other: &ReplayProfiler) {
+        self.fetch_duration += other.fetch_duration;
+        self.block_totals.add_assign(&other.block_totals);
+        self.blocks_processed += other.blocks_processed;
     }
 
     fn print_summary(&self, planned_blocks: usize) {
@@ -205,35 +213,72 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
     let print_help_and_exit = || -> ! {
         let n = &argv[0];
         eprintln!("Usage:");
-        eprintln!("  {n} <database-path>");
-        eprintln!("  {n} <database-path> prefix <index-block-hash-prefix>");
-        eprintln!("  {n} <database-path> index-range <start-block> <end-block>");
-        eprintln!("  {n} <database-path> range <start-block> <end-block>");
-        eprintln!("  {n} <database-path> <first|last> <block-count>");
+        eprintln!("  {n} <database-path> [--threads N]");
+        eprintln!("  {n} <database-path> [--threads N] prefix <index-block-hash-prefix>");
+        eprintln!("  {n} <database-path> [--threads N] index-range <start-block> <end-block>");
+        eprintln!("  {n} <database-path> [--threads N] range <start-block> <end-block>");
+        eprintln!("  {n} <database-path> [--threads N] <first|last> <block-count>");
         process::exit(1);
     };
     let start = Instant::now();
     let db_path = argv.get(1).unwrap_or_else(|| print_help_and_exit());
-    let mode = argv.get(2).map(String::as_str);
+    let mut thread_count = 1;
+    let mut idx = 2;
+    let mut mode_index: Option<usize> = None;
+    while let Some(arg) = argv.get(idx) {
+        if arg == "--threads" {
+            let value = argv
+                .get(idx + 1)
+                .unwrap_or_else(|| print_help_and_exit())
+                .parse::<usize>()
+                .unwrap_or_else(|_| {
+                    eprintln!("Invalid value for --threads: {}", argv[idx + 1]);
+                    process::exit(1);
+                });
+            thread_count = value;
+            idx += 2;
+            continue;
+        }
+        mode_index = Some(idx);
+        break;
+    }
+    let mode = mode_index.map(|i| argv[i].as_str());
+    let mode_idx = mode_index.unwrap_or(idx);
     let staging_blocks_db_path = format!("{db_path}/chainstate/vm/index.sqlite");
     let conn =
         Connection::open_with_flags(&staging_blocks_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
 
     let query = match mode {
-        Some("prefix") => format!(
-            "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 AND index_block_hash LIKE \"{}%\"",
-            argv[3]
-        ),
-        Some("first") => format!(
-            "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height ASC LIMIT {}",
-            argv[3]
-        ),
+        Some("prefix") => {
+            let prefix = argv
+                .get(mode_idx + 1)
+                .unwrap_or_else(|| print_help_and_exit());
+            format!(
+                "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 AND index_block_hash LIKE \"{}%\"",
+                prefix
+            )
+        }
+        Some("first") => {
+            let limit = argv
+                .get(mode_idx + 1)
+                .unwrap_or_else(|| print_help_and_exit());
+            format!(
+                "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height ASC LIMIT {}",
+                limit
+            )
+        }
         Some("range") => {
-            let arg4 = argv[3]
+            let arg4 = argv
+                .get(mode_idx + 1)
+                .unwrap_or_else(|| print_help_and_exit())
                 .parse::<u64>()
                 .expect("<start_block> not a valid u64");
-            let arg5 = argv[4].parse::<u64>().expect("<end-block> not a valid u64");
+            let arg5 = argv
+                .get(mode_idx + 2)
+                .unwrap_or_else(|| print_help_and_exit())
+                .parse::<u64>()
+                .expect("<end-block> not a valid u64");
             let start = arg4.saturating_sub(1);
             let blocks = arg5.saturating_sub(arg4);
             format!(
@@ -241,19 +286,30 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
             )
         }
         Some("index-range") => {
-            let start = argv[3]
+            let start = argv
+                .get(mode_idx + 1)
+                .unwrap_or_else(|| print_help_and_exit())
                 .parse::<u64>()
                 .expect("<start_block> not a valid u64");
-            let end = argv[4].parse::<u64>().expect("<end-block> not a valid u64");
+            let end = argv
+                .get(mode_idx + 2)
+                .unwrap_or_else(|| print_help_and_exit())
+                .parse::<u64>()
+                .expect("<end-block> not a valid u64");
             let blocks = end.saturating_sub(start);
             format!(
                 "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY index_block_hash ASC LIMIT {start}, {blocks}"
             )
         }
-        Some("last") => format!(
-            "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height DESC LIMIT {}",
-            argv[3]
-        ),
+        Some("last") => {
+            let limit = argv
+                .get(mode_idx + 1)
+                .unwrap_or_else(|| print_help_and_exit());
+            format!(
+                "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height DESC LIMIT {}",
+                limit
+            )
+        }
         Some(_) => print_help_and_exit(),
         // Default to ALL blocks
         None => "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0".into(),
@@ -274,13 +330,100 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         prof.record_fetch(fetch_duration);
     }
 
+    let available_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if thread_count == 0 {
+        thread_count = available_threads;
+    }
+    if thread_count > available_threads {
+        thread_count = available_threads;
+    }
+    if thread_count == 1 {
+        if let Ok(env_threads) = std::env::var("VALIDATE_THREADS") {
+            if let Ok(val) = env_threads.parse::<usize>() {
+                thread_count = if val == 0 {
+                    available_threads
+                } else {
+                    val.min(available_threads).max(1)
+                };
+            }
+        }
+    }
+
+    let index_block_hashes = Arc::new(index_block_hashes);
     let total = index_block_hashes.len();
     println!("Will check {total} blocks");
-    for (i, index_block_hash) in index_block_hashes.iter().enumerate() {
-        if i % 100 == 0 {
-            println!("Checked {i}...");
+
+    let profiling_enabled = profiler.is_some();
+    let conf_owned = conf.cloned();
+
+    if thread_count <= 1 {
+        let mut worker = StagingValidationWorker::new(db_path.as_str(), conf_owned.clone())
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to initialize validator: {e}");
+                process::exit(1);
+            });
+        for (i, index_block_hash) in index_block_hashes.iter().enumerate() {
+            if i % 100 == 0 {
+                println!("Checked {i}...");
+            }
+            let timings = worker.validate_block(index_block_hash, profiling_enabled);
+            if let (Some(prof), Some(sample)) = (&mut profiler, timings) {
+                prof.record_block(sample);
+            }
         }
-        replay_staging_block(db_path, index_block_hash, conf, profiler.as_mut());
+    } else {
+        println!("Using {thread_count} threads (max {})", available_threads);
+        let next_index = Arc::new(AtomicUsize::new(0));
+        let processed = Arc::new(AtomicUsize::new(0));
+        let db_path_arc = Arc::new(db_path.to_string());
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let hashes = Arc::clone(&index_block_hashes);
+                let next = Arc::clone(&next_index);
+                let processed_ctr = Arc::clone(&processed);
+                let db_path = Arc::clone(&db_path_arc);
+                let conf_clone = conf_owned.clone();
+
+                thread::spawn(move || {
+                    let mut worker = StagingValidationWorker::new(db_path.as_str(), conf_clone)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to initialize validator: {e}");
+                            process::exit(1);
+                        });
+                    let mut local_profiler = profiling_enabled.then_some(ReplayProfiler::default());
+
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= hashes.len() {
+                            break;
+                        }
+                        let block_hash = &hashes[idx];
+                        let timings = worker.validate_block(block_hash, profiling_enabled);
+                        if let (Some(prof), Some(sample)) = (&mut local_profiler, timings) {
+                            prof.record_block(sample);
+                        }
+
+                        let current = processed_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+                        if current % 100 == 0 {
+                            println!("Checked {current}...");
+                        }
+                    }
+
+                    local_profiler
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            if let Some(worker_profiler) = handle.join().unwrap() {
+                if let Some(ref mut prof) = profiler {
+                    prof.merge(&worker_profiler);
+                }
+            }
+        }
     }
     println!("Finished. run_time_seconds = {}", start.elapsed().as_secs());
 
@@ -674,122 +817,135 @@ pub fn command_contract_hash(argv: &[String], _conf: Option<&Config>) {
     println!("Contract hash for {contract_path}:\n{hex_string}");
 }
 
-/// Fetch and process a `StagingBlock` from database and call `replay_block()` to validate
-fn replay_staging_block(
-    db_path: &str,
-    index_block_hash_hex: &str,
-    conf: Option<&Config>,
-    profiler: Option<&mut ReplayProfiler>,
-) {
-    let block_id = StacksBlockId::from_hex(index_block_hash_hex).unwrap();
-    let chain_state_path = format!("{db_path}/chainstate/");
-    let sort_db_path = format!("{db_path}/burnchain/sortition");
+/// Fetch and process `StagingBlock`s using reusable database handles.
+struct StagingValidationWorker {
+    chainstate: StacksChainState,
+    sortdb: SortitionDB,
+    blocks_path: String,
+}
 
-    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+impl StagingValidationWorker {
+    fn new(db_path: &str, conf: Option<Config>) -> Result<Self, String> {
+        let conf = conf.unwrap_or_else(|| (*DEFAULT_MAINNET_CONFIG).clone());
+        let chain_state_path = format!("{db_path}/chainstate/");
+        let sort_db_path = format!("{db_path}/burnchain/sortition");
 
-    let total_start = Instant::now();
-    let mut timings = profiler.as_ref().map(|_| ReplayTimings::default());
+        let (chainstate, _) = StacksChainState::open(
+            conf.is_mainnet(),
+            conf.burnchain.chain_id,
+            &chain_state_path,
+            None,
+        )
+        .map_err(|e| format!("Failed to open Stacks chainstate: {e:?}"))?;
 
-    let chainstate_open_start = Instant::now();
-    let (mut chainstate, _) = StacksChainState::open(
-        conf.is_mainnet(),
-        conf.burnchain.chain_id,
-        &chain_state_path,
-        None,
-    )
-    .unwrap();
-    if let Some(ref mut sample) = timings {
-        sample.chainstate_open = chainstate_open_start.elapsed();
+        let burnchain = conf.get_burnchain();
+        let epochs = conf.burnchain.get_epoch_list();
+        let sortdb = SortitionDB::connect(
+            &sort_db_path,
+            burnchain.first_block_height,
+            &burnchain.first_block_hash,
+            u64::from(burnchain.first_block_timestamp),
+            &epochs,
+            burnchain.pox_constants.clone(),
+            None,
+            true,
+        )
+        .map_err(|e| format!("Failed to connect SortitionDB: {e:?}"))?;
+
+        Ok(Self {
+            blocks_path: chainstate.blocks_path.clone(),
+            chainstate,
+            sortdb,
+        })
     }
 
-    let burnchain = conf.get_burnchain();
-    let epochs = conf.burnchain.get_epoch_list();
-    let sortdb_connect_start = Instant::now();
-    let mut sortdb = SortitionDB::connect(
-        &sort_db_path,
-        burnchain.first_block_height,
-        &burnchain.first_block_hash,
-        u64::from(burnchain.first_block_timestamp),
-        &epochs,
-        burnchain.pox_constants.clone(),
-        None,
-        true,
-    )
-    .unwrap();
-    let sort_tx = sortdb.tx_begin_at_tip();
-    if let Some(ref mut sample) = timings {
-        sample.sortdb_connect = sortdb_connect_start.elapsed();
-    }
+    fn validate_block(
+        &mut self,
+        index_block_hash_hex: &str,
+        profiling: bool,
+    ) -> Option<ReplayTimings> {
+        let block_id = StacksBlockId::from_hex(index_block_hash_hex).unwrap();
 
-    let blocks_path = chainstate.blocks_path.clone();
-    let staging_load_start = Instant::now();
-    let (mut chainstate_tx, clarity_instance) = chainstate
-        .chainstate_tx_begin()
-        .expect("Failed to start chainstate tx");
-    let mut next_staging_block =
-        StacksChainState::load_staging_block_info(&chainstate_tx.tx, &block_id)
-            .expect("Failed to load staging block data")
-            .expect("No such index block hash in block database");
-    if let Some(ref mut sample) = timings {
-        sample.staging_block_load = staging_load_start.elapsed();
-    }
+        let total_start = Instant::now();
+        let mut timings = profiling.then_some(ReplayTimings::default());
 
-    let block_bytes_start = Instant::now();
-    next_staging_block.block_data = StacksChainState::load_block_bytes(
-        &blocks_path,
-        &next_staging_block.consensus_hash,
-        &next_staging_block.anchored_block_hash,
-    )
-    .unwrap()
-    .unwrap_or_default();
-    if let Some(ref mut sample) = timings {
-        sample.block_bytes_load = block_bytes_start.elapsed();
-    }
-
-    let parent_lookup_start = Instant::now();
-    let Some(parent_header_info) =
-        StacksChainState::get_parent_header_info(&mut chainstate_tx, &next_staging_block).unwrap()
-    else {
-        println!("Failed to load parent head info for block: {index_block_hash_hex}");
+        let chainstate_start = Instant::now();
+        let (mut chainstate_tx, clarity_instance) = self
+            .chainstate
+            .chainstate_tx_begin()
+            .expect("Failed to start chainstate tx");
         if let Some(ref mut sample) = timings {
+            sample.chainstate_open = chainstate_start.elapsed();
+        }
+
+        let staging_load_start = Instant::now();
+        let mut next_staging_block =
+            StacksChainState::load_staging_block_info(&chainstate_tx.tx, &block_id)
+                .expect("Failed to load staging block data")
+                .expect("No such index block hash in block database");
+        if let Some(ref mut sample) = timings {
+            sample.staging_block_load = staging_load_start.elapsed();
+        }
+
+        let block_bytes_start = Instant::now();
+        next_staging_block.block_data = StacksChainState::load_block_bytes(
+            &self.blocks_path,
+            &next_staging_block.consensus_hash,
+            &next_staging_block.anchored_block_hash,
+        )
+        .unwrap()
+        .unwrap_or_default();
+        if let Some(ref mut sample) = timings {
+            sample.block_bytes_load = block_bytes_start.elapsed();
+        }
+
+        let parent_lookup_start = Instant::now();
+        let Some(parent_header_info) =
+            StacksChainState::get_parent_header_info(&mut chainstate_tx, &next_staging_block)
+                .unwrap()
+        else {
+            println!("Failed to load parent head info for block: {index_block_hash_hex}");
+            if let Some(ref mut sample) = timings {
+                sample.total = total_start.elapsed();
+            }
+            return timings;
+        };
+        if let Some(ref mut sample) = timings {
+            sample.parent_lookup = parent_lookup_start.elapsed();
+        }
+
+        let sortdb_start = Instant::now();
+        let sort_tx = self.sortdb.tx_begin_at_tip();
+        if let Some(ref mut sample) = timings {
+            sample.sortdb_connect = sortdb_start.elapsed();
+        }
+
+        let block = StacksChainState::extract_stacks_block(&next_staging_block)
+            .expect("Failed to get block");
+        let block_size = next_staging_block.block_data.len() as u64;
+
+        let append_start = Instant::now();
+        replay_block(
+            sort_tx,
+            chainstate_tx,
+            clarity_instance,
+            &parent_header_info,
+            &next_staging_block.parent_microblock_hash,
+            next_staging_block.parent_microblock_seq,
+            &block_id,
+            &block,
+            block_size,
+            &next_staging_block.consensus_hash,
+            &next_staging_block.anchored_block_hash,
+            next_staging_block.commit_burn,
+            next_staging_block.sortition_burn,
+        );
+        if let Some(ref mut sample) = timings {
+            sample.append_block = append_start.elapsed();
             sample.total = total_start.elapsed();
         }
-        if let (Some(prof), Some(sample)) = (profiler, timings) {
-            prof.record_block(sample);
-        }
-        return;
-    };
-    if let Some(ref mut sample) = timings {
-        sample.parent_lookup = parent_lookup_start.elapsed();
-    }
 
-    let block =
-        StacksChainState::extract_stacks_block(&next_staging_block).expect("Failed to get block");
-    let block_size = next_staging_block.block_data.len() as u64;
-
-    let append_start = Instant::now();
-    replay_block(
-        sort_tx,
-        chainstate_tx,
-        clarity_instance,
-        &parent_header_info,
-        &next_staging_block.parent_microblock_hash,
-        next_staging_block.parent_microblock_seq,
-        &block_id,
-        &block,
-        block_size,
-        &next_staging_block.consensus_hash,
-        &next_staging_block.anchored_block_hash,
-        next_staging_block.commit_burn,
-        next_staging_block.sortition_burn,
-    );
-    if let Some(ref mut sample) = timings {
-        sample.append_block = append_start.elapsed();
-        sample.total = total_start.elapsed();
-    }
-
-    if let (Some(prof), Some(sample)) = (profiler, timings) {
-        prof.record_block(sample);
+        timings
     }
 }
 
