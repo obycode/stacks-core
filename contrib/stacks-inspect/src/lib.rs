@@ -14,7 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use clarity::types::chainstate::SortitionId;
@@ -55,6 +55,87 @@ use stackslib::util_lib::db::IndexDBTx;
 #[derive(Debug, Default)]
 pub struct CommonOpts {
     pub config: Option<Config>,
+}
+
+#[derive(Default, Clone)]
+struct ReplayTimings {
+    chainstate_open: Duration,
+    sortdb_connect: Duration,
+    staging_block_load: Duration,
+    block_bytes_load: Duration,
+    parent_lookup: Duration,
+    append_block: Duration,
+    total: Duration,
+}
+
+impl ReplayTimings {
+    fn add_assign(&mut self, other: &ReplayTimings) {
+        self.chainstate_open += other.chainstate_open;
+        self.sortdb_connect += other.sortdb_connect;
+        self.staging_block_load += other.staging_block_load;
+        self.block_bytes_load += other.block_bytes_load;
+        self.parent_lookup += other.parent_lookup;
+        self.append_block += other.append_block;
+        self.total += other.total;
+    }
+}
+
+#[derive(Default)]
+struct ReplayProfiler {
+    fetch_duration: Duration,
+    block_totals: ReplayTimings,
+    blocks_processed: usize,
+}
+
+impl ReplayProfiler {
+    fn maybe_enabled() -> Option<Self> {
+        match std::env::var("VALIDATE_PROF") {
+            Ok(val) if val == "0" || val.eq_ignore_ascii_case("false") => None,
+            Ok(_) => Some(Self::default()),
+            Err(_) => None,
+        }
+    }
+
+    fn record_fetch(&mut self, duration: Duration) {
+        self.fetch_duration += duration;
+    }
+
+    fn record_block(&mut self, timings: ReplayTimings) {
+        self.blocks_processed += 1;
+        self.block_totals.add_assign(&timings);
+    }
+
+    fn print_summary(&self, planned_blocks: usize) {
+        if self.blocks_processed == 0 {
+            println!(
+                "[validate-block profiler] No blocks processed; fetch_time={:.3}s",
+                self.fetch_duration.as_secs_f64()
+            );
+            return;
+        }
+
+        let blocks = self.blocks_processed as f64;
+        let fmt = |d: Duration| -> f64 { d.as_secs_f64() * 1_000.0 };
+
+        println!(
+            "[validate-block profiler] planned_blocks={planned_blocks}, processed_blocks={}",
+            self.blocks_processed
+        );
+        println!(
+            "[validate-block profiler] fetch_index_ms={:.3}",
+            fmt(self.fetch_duration)
+        );
+        println!(
+            "[validate-block profiler] avg_ms_per_block: chainstate_open={:.3}, sortdb_connect={:.3}, staging_block_load={:.3}, block_bytes_load={:.3}, parent_lookup={:.3}, append_block={:.3}, total={:.3}",
+            fmt(self.block_totals.chainstate_open) / blocks,
+            fmt(self.block_totals.sortdb_connect) / blocks,
+            fmt(self.block_totals.staging_block_load) / blocks,
+            fmt(self.block_totals.block_bytes_load) / blocks,
+            fmt(self.block_totals.parent_lookup) / blocks,
+            fmt(self.block_totals.append_block) / blocks,
+            fmt(self.block_totals.total) / blocks,
+        );
+    }
 }
 
 /// Process arguments common to many `stacks-inspect` subcommands and drain them from `argv`
@@ -178,12 +259,19 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         None => "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0".into(),
     };
 
+    let fetch_start = Instant::now();
     let mut stmt = conn.prepare(&query).unwrap();
     let mut hashes_set = stmt.query(NO_PARAMS).unwrap();
 
     let mut index_block_hashes: Vec<String> = vec![];
     while let Ok(Some(row)) = hashes_set.next() {
         index_block_hashes.push(row.get(0).unwrap());
+    }
+    let fetch_duration = fetch_start.elapsed();
+
+    let mut profiler = ReplayProfiler::maybe_enabled();
+    if let Some(ref mut prof) = profiler {
+        prof.record_fetch(fetch_duration);
     }
 
     let total = index_block_hashes.len();
@@ -192,9 +280,13 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         if i % 100 == 0 {
             println!("Checked {i}...");
         }
-        replay_staging_block(db_path, index_block_hash, conf);
+        replay_staging_block(db_path, index_block_hash, conf, profiler.as_mut());
     }
     println!("Finished. run_time_seconds = {}", start.elapsed().as_secs());
+
+    if let Some(ref profiler) = profiler {
+        profiler.print_summary(total);
+    }
 }
 
 /// Replay blocks from chainstate database
@@ -583,13 +675,22 @@ pub fn command_contract_hash(argv: &[String], _conf: Option<&Config>) {
 }
 
 /// Fetch and process a `StagingBlock` from database and call `replay_block()` to validate
-fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<&Config>) {
+fn replay_staging_block(
+    db_path: &str,
+    index_block_hash_hex: &str,
+    conf: Option<&Config>,
+    profiler: Option<&mut ReplayProfiler>,
+) {
     let block_id = StacksBlockId::from_hex(index_block_hash_hex).unwrap();
     let chain_state_path = format!("{db_path}/chainstate/");
     let sort_db_path = format!("{db_path}/burnchain/sortition");
 
     let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
 
+    let total_start = Instant::now();
+    let mut timings = profiler.as_ref().map(|_| ReplayTimings::default());
+
+    let chainstate_open_start = Instant::now();
     let (mut chainstate, _) = StacksChainState::open(
         conf.is_mainnet(),
         conf.burnchain.chain_id,
@@ -597,9 +698,13 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         None,
     )
     .unwrap();
+    if let Some(ref mut sample) = timings {
+        sample.chainstate_open = chainstate_open_start.elapsed();
+    }
 
     let burnchain = conf.get_burnchain();
     let epochs = conf.burnchain.get_epoch_list();
+    let sortdb_connect_start = Instant::now();
     let mut sortdb = SortitionDB::connect(
         &sort_db_path,
         burnchain.first_block_height,
@@ -612,8 +717,12 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
     )
     .unwrap();
     let sort_tx = sortdb.tx_begin_at_tip();
+    if let Some(ref mut sample) = timings {
+        sample.sortdb_connect = sortdb_connect_start.elapsed();
+    }
 
     let blocks_path = chainstate.blocks_path.clone();
+    let staging_load_start = Instant::now();
     let (mut chainstate_tx, clarity_instance) = chainstate
         .chainstate_tx_begin()
         .expect("Failed to start chainstate tx");
@@ -621,7 +730,11 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         StacksChainState::load_staging_block_info(&chainstate_tx.tx, &block_id)
             .expect("Failed to load staging block data")
             .expect("No such index block hash in block database");
+    if let Some(ref mut sample) = timings {
+        sample.staging_block_load = staging_load_start.elapsed();
+    }
 
+    let block_bytes_start = Instant::now();
     next_staging_block.block_data = StacksChainState::load_block_bytes(
         &blocks_path,
         &next_staging_block.consensus_hash,
@@ -629,18 +742,32 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
     )
     .unwrap()
     .unwrap_or_default();
+    if let Some(ref mut sample) = timings {
+        sample.block_bytes_load = block_bytes_start.elapsed();
+    }
 
+    let parent_lookup_start = Instant::now();
     let Some(parent_header_info) =
         StacksChainState::get_parent_header_info(&mut chainstate_tx, &next_staging_block).unwrap()
     else {
         println!("Failed to load parent head info for block: {index_block_hash_hex}");
+        if let Some(ref mut sample) = timings {
+            sample.total = total_start.elapsed();
+        }
+        if let (Some(prof), Some(sample)) = (profiler, timings) {
+            prof.record_block(sample);
+        }
         return;
     };
+    if let Some(ref mut sample) = timings {
+        sample.parent_lookup = parent_lookup_start.elapsed();
+    }
 
     let block =
         StacksChainState::extract_stacks_block(&next_staging_block).expect("Failed to get block");
     let block_size = next_staging_block.block_data.len() as u64;
 
+    let append_start = Instant::now();
     replay_block(
         sort_tx,
         chainstate_tx,
@@ -656,6 +783,14 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         next_staging_block.commit_burn,
         next_staging_block.sortition_burn,
     );
+    if let Some(ref mut sample) = timings {
+        sample.append_block = append_start.elapsed();
+        sample.total = total_start.elapsed();
+    }
+
+    if let (Some(prof), Some(sample)) = (profiler, timings) {
+        prof.record_block(sample);
+    }
 }
 
 /// Process a mock mined block and call `replay_block()` to validate
