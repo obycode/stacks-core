@@ -4946,7 +4946,7 @@ impl StacksChainState {
     ///  `SortitionDBRef` captures trait functions that Clarity does
     ///  not need, and Rust does not support trait upcasting (even
     ///  though it would theoretically be safe).
-    pub fn setup_block<'a, 'b>(
+    fn setup_block_inner<'a, 'b>(
         chainstate_tx: &'b mut ChainstateTx,
         clarity_instance: &'a mut ClarityInstance,
         burn_dbconn: &'b dyn BurnStateDB,
@@ -4961,6 +4961,7 @@ impl StacksChainState {
         parent_microblocks: &[StacksMicroblock],
         mainnet: bool,
         miner_id_opt: Option<usize>,
+        use_ephemeral: bool,
     ) -> Result<SetupBlockResult<'a, 'b>, Error> {
         let parent_index_hash = StacksBlockId::new(parent_consensus_hash, parent_header_hash);
         let parent_sortition_id = burn_dbconn
@@ -5014,15 +5015,27 @@ impl StacksChainState {
             ExecutionCost::ZERO
         };
 
-        let mut clarity_tx = StacksChainState::chainstate_block_begin(
-            chainstate_tx,
-            clarity_instance,
-            burn_dbconn,
-            parent_consensus_hash,
-            parent_header_hash,
-            &MINER_BLOCK_CONSENSUS_HASH,
-            &MINER_BLOCK_HEADER_HASH,
-        );
+        let mut clarity_tx = if use_ephemeral {
+            StacksChainState::chainstate_ephemeral_block_begin(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                parent_consensus_hash,
+                parent_header_hash,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+        } else {
+            StacksChainState::chainstate_block_begin(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                parent_consensus_hash,
+                parent_header_hash,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+        };
 
         clarity_tx.reset_cost(parent_block_cost.clone());
 
@@ -5219,6 +5232,76 @@ impl StacksChainState {
         })
     }
 
+    pub fn setup_block<'a, 'b>(
+        chainstate_tx: &'b mut ChainstateTx,
+        clarity_instance: &'a mut ClarityInstance,
+        burn_dbconn: &'b dyn BurnStateDB,
+        sortition_dbconn: &'b dyn SortitionDBRef,
+        conn: &Connection,
+        pox_constants: &PoxConstants,
+        chain_tip: &StacksHeaderInfo,
+        burn_tip: &BurnchainHeaderHash,
+        burn_tip_height: u32,
+        parent_consensus_hash: &ConsensusHash,
+        parent_header_hash: &BlockHeaderHash,
+        parent_microblocks: &[StacksMicroblock],
+        mainnet: bool,
+        miner_id_opt: Option<usize>,
+    ) -> Result<SetupBlockResult<'a, 'b>, Error> {
+        Self::setup_block_inner(
+            chainstate_tx,
+            clarity_instance,
+            burn_dbconn,
+            sortition_dbconn,
+            conn,
+            pox_constants,
+            chain_tip,
+            burn_tip,
+            burn_tip_height,
+            parent_consensus_hash,
+            parent_header_hash,
+            parent_microblocks,
+            mainnet,
+            miner_id_opt,
+            false,
+        )
+    }
+
+    pub fn setup_block_ephemeral<'a, 'b>(
+        chainstate_tx: &'b mut ChainstateTx,
+        clarity_instance: &'a mut ClarityInstance,
+        burn_dbconn: &'b dyn BurnStateDB,
+        sortition_dbconn: &'b dyn SortitionDBRef,
+        conn: &Connection,
+        pox_constants: &PoxConstants,
+        chain_tip: &StacksHeaderInfo,
+        burn_tip: &BurnchainHeaderHash,
+        burn_tip_height: u32,
+        parent_consensus_hash: &ConsensusHash,
+        parent_header_hash: &BlockHeaderHash,
+        parent_microblocks: &[StacksMicroblock],
+        mainnet: bool,
+        miner_id_opt: Option<usize>,
+    ) -> Result<SetupBlockResult<'a, 'b>, Error> {
+        Self::setup_block_inner(
+            chainstate_tx,
+            clarity_instance,
+            burn_dbconn,
+            sortition_dbconn,
+            conn,
+            pox_constants,
+            chain_tip,
+            burn_tip,
+            burn_tip_height,
+            parent_consensus_hash,
+            parent_header_hash,
+            parent_microblocks,
+            mainnet,
+            miner_id_opt,
+            true,
+        )
+    }
+
     /// This function is called in both `append_block` in blocks.rs (follower) and
     /// `mine_anchored_block` in miner.rs.
     /// Processes matured miner rewards, alters liquid supply of ustx, processes
@@ -5294,7 +5377,7 @@ impl StacksChainState {
     /// necessary so that the Headers database and Clarity database's
     /// transactions can commit very close to one another, after the
     /// event observer has emitted.
-    pub fn append_block<'a>(
+    fn append_block_inner<'a>(
         chainstate_tx: &mut ChainstateTx,
         clarity_instance: &'a mut ClarityInstance,
         burn_dbconn: &mut SortitionHandleTx,
@@ -5310,6 +5393,7 @@ impl StacksChainState {
         burnchain_commit_burn: u64,
         burnchain_sortition_burn: u64,
         do_not_advance: bool,
+        use_ephemeral: bool,
     ) -> Result<
         (
             StacksEpochReceipt,
@@ -5419,22 +5503,41 @@ impl StacksChainState {
             burn_delegate_stx_ops,
             signer_set_calc,
             burn_vote_for_aggregate_key_ops,
-        } = StacksChainState::setup_block(
-            chainstate_tx,
-            clarity_instance,
-            burn_dbconn,
-            burn_dbconn,
-            burn_dbconn.tx(),
-            pox_constants,
-            parent_chain_tip,
-            &parent_burn_hash,
-            chain_tip_burn_header_height,
-            &parent_consensus_hash,
-            &parent_block_hash,
-            microblocks,
-            mainnet,
-            None,
-        )?;
+        } = if use_ephemeral {
+            StacksChainState::setup_block_ephemeral(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                burn_dbconn,
+                burn_dbconn.tx(),
+                pox_constants,
+                parent_chain_tip,
+                &parent_burn_hash,
+                chain_tip_burn_header_height,
+                &parent_consensus_hash,
+                &parent_block_hash,
+                microblocks,
+                mainnet,
+                None,
+            )?
+        } else {
+            StacksChainState::setup_block(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                burn_dbconn,
+                burn_dbconn.tx(),
+                pox_constants,
+                parent_chain_tip,
+                &parent_burn_hash,
+                chain_tip_burn_header_height,
+                &parent_consensus_hash,
+                &parent_block_hash,
+                microblocks,
+                mainnet,
+                None,
+            )?
+        };
 
         let block_limit = clarity_tx.block_limit().unwrap_or_else(|| {
             warn!("Failed to read transaction block limit");
@@ -5799,6 +5902,94 @@ impl StacksChainState {
         };
 
         Ok((epoch_receipt, clarity_commit, reward_set_data))
+    }
+
+    pub fn append_block<'a>(
+        chainstate_tx: &mut ChainstateTx,
+        clarity_instance: &'a mut ClarityInstance,
+        burn_dbconn: &mut SortitionHandleTx,
+        pox_constants: &PoxConstants,
+        parent_chain_tip: &StacksHeaderInfo,
+        chain_tip_consensus_hash: &ConsensusHash,
+        chain_tip_burn_header_hash: &BurnchainHeaderHash,
+        chain_tip_burn_header_height: u32,
+        chain_tip_burn_header_timestamp: u64,
+        block: &StacksBlock,
+        block_size: u64,
+        microblocks: &[StacksMicroblock],
+        burnchain_commit_burn: u64,
+        burnchain_sortition_burn: u64,
+        do_not_advance: bool,
+    ) -> Result<
+        (
+            StacksEpochReceipt,
+            PreCommitClarityBlock<'a>,
+            Option<RewardSetData>,
+        ),
+        Error,
+    > {
+        Self::append_block_inner(
+            chainstate_tx,
+            clarity_instance,
+            burn_dbconn,
+            pox_constants,
+            parent_chain_tip,
+            chain_tip_consensus_hash,
+            chain_tip_burn_header_hash,
+            chain_tip_burn_header_height,
+            chain_tip_burn_header_timestamp,
+            block,
+            block_size,
+            microblocks,
+            burnchain_commit_burn,
+            burnchain_sortition_burn,
+            do_not_advance,
+            false,
+        )
+    }
+
+    pub fn append_block_ephemeral<'a>(
+        chainstate_tx: &mut ChainstateTx,
+        clarity_instance: &'a mut ClarityInstance,
+        burn_dbconn: &mut SortitionHandleTx,
+        pox_constants: &PoxConstants,
+        parent_chain_tip: &StacksHeaderInfo,
+        chain_tip_consensus_hash: &ConsensusHash,
+        chain_tip_burn_header_hash: &BurnchainHeaderHash,
+        chain_tip_burn_header_height: u32,
+        chain_tip_burn_header_timestamp: u64,
+        block: &StacksBlock,
+        block_size: u64,
+        microblocks: &[StacksMicroblock],
+        burnchain_commit_burn: u64,
+        burnchain_sortition_burn: u64,
+        do_not_advance: bool,
+    ) -> Result<
+        (
+            StacksEpochReceipt,
+            PreCommitClarityBlock<'a>,
+            Option<RewardSetData>,
+        ),
+        Error,
+    > {
+        Self::append_block_inner(
+            chainstate_tx,
+            clarity_instance,
+            burn_dbconn,
+            pox_constants,
+            parent_chain_tip,
+            chain_tip_consensus_hash,
+            chain_tip_burn_header_hash,
+            chain_tip_burn_header_height,
+            chain_tip_burn_header_timestamp,
+            block,
+            block_size,
+            microblocks,
+            burnchain_commit_burn,
+            burnchain_sortition_burn,
+            do_not_advance,
+            true,
+        )
     }
 
     /// Verify that a Stacks anchored block attaches to its parent anchored block.

@@ -59,6 +59,72 @@ pub struct CommonOpts {
     pub config: Option<Config>,
 }
 
+fn replay_block(
+    sort_tx: IndexDBTx<SortitionHandleContext, SortitionId>,
+    chainstate_tx: ChainstateTx,
+    clarity_instance: &mut ClarityInstance,
+    parent_header_info: &StacksHeaderInfo,
+    parent_microblock_hash: &BlockHeaderHash,
+    parent_microblock_seq: u16,
+    block_id: &StacksBlockId,
+    block: &StacksBlock,
+    block_size: u64,
+    block_consensus_hash: &ConsensusHash,
+    block_hash: &BlockHeaderHash,
+    block_commit_burn: u64,
+    block_sortition_burn: u64,
+) {
+    replay_block_with_mode(
+        sort_tx,
+        chainstate_tx,
+        clarity_instance,
+        parent_header_info,
+        parent_microblock_hash,
+        parent_microblock_seq,
+        block_id,
+        block,
+        block_size,
+        block_consensus_hash,
+        block_hash,
+        block_commit_burn,
+        block_sortition_burn,
+        false,
+    )
+}
+
+fn replay_block_ephemeral(
+    sort_tx: IndexDBTx<SortitionHandleContext, SortitionId>,
+    chainstate_tx: ChainstateTx,
+    clarity_instance: &mut ClarityInstance,
+    parent_header_info: &StacksHeaderInfo,
+    parent_microblock_hash: &BlockHeaderHash,
+    parent_microblock_seq: u16,
+    block_id: &StacksBlockId,
+    block: &StacksBlock,
+    block_size: u64,
+    block_consensus_hash: &ConsensusHash,
+    block_hash: &BlockHeaderHash,
+    block_commit_burn: u64,
+    block_sortition_burn: u64,
+) {
+    replay_block_with_mode(
+        sort_tx,
+        chainstate_tx,
+        clarity_instance,
+        parent_header_info,
+        parent_microblock_hash,
+        parent_microblock_seq,
+        block_id,
+        block,
+        block_size,
+        block_consensus_hash,
+        block_hash,
+        block_commit_burn,
+        block_sortition_burn,
+        true,
+    )
+}
+
 #[derive(Default, Clone)]
 struct ReplayTimings {
     chainstate_open: Duration,
@@ -925,7 +991,7 @@ impl StagingValidationWorker {
         let block_size = next_staging_block.block_data.len() as u64;
 
         let append_start = Instant::now();
-        replay_block(
+        replay_block_ephemeral(
             sort_tx,
             chainstate_tx,
             clarity_instance,
@@ -1022,7 +1088,7 @@ fn replay_mock_mined_block(db_path: &str, block: AssembledAnchorBlock, conf: Opt
 }
 
 /// Validate a block against chainstate
-fn replay_block(
+fn replay_block_with_mode(
     mut sort_tx: IndexDBTx<SortitionHandleContext, SortitionId>,
     mut chainstate_tx: ChainstateTx,
     clarity_instance: &mut ClarityInstance,
@@ -1036,6 +1102,7 @@ fn replay_block(
     block_hash: &BlockHeaderHash,
     block_commit_burn: u64,
     block_sortition_burn: u64,
+    use_ephemeral: bool,
 ) {
     let parent_block_header = match &parent_header_info.anchored_header {
         StacksBlockHeaderTypes::Epoch2(bh) => bh,
@@ -1121,23 +1188,45 @@ fn replay_block(
 
     let pox_constants = sort_tx.context.pox_constants.clone();
 
-    match StacksChainState::append_block(
-        &mut chainstate_tx,
-        clarity_instance,
-        &mut sort_tx,
-        &pox_constants,
-        parent_header_info,
-        block_consensus_hash,
-        &burn_header_hash,
-        burn_header_height,
-        burn_header_timestamp,
-        block,
-        block_size,
-        &next_microblocks,
-        block_commit_burn,
-        block_sortition_burn,
-        true,
-    ) {
+    let append_result = if use_ephemeral {
+        StacksChainState::append_block_ephemeral(
+            &mut chainstate_tx,
+            clarity_instance,
+            &mut sort_tx,
+            &pox_constants,
+            parent_header_info,
+            block_consensus_hash,
+            &burn_header_hash,
+            burn_header_height,
+            burn_header_timestamp,
+            block,
+            block_size,
+            &next_microblocks,
+            block_commit_burn,
+            block_sortition_burn,
+            true,
+        )
+    } else {
+        StacksChainState::append_block(
+            &mut chainstate_tx,
+            clarity_instance,
+            &mut sort_tx,
+            &pox_constants,
+            parent_header_info,
+            block_consensus_hash,
+            &burn_header_hash,
+            burn_header_height,
+            burn_header_timestamp,
+            block,
+            block_size,
+            &next_microblocks,
+            block_commit_burn,
+            block_sortition_burn,
+            true,
+        )
+    };
+
+    match append_result {
         Ok((receipt, _, _)) => {
             if receipt.anchored_block_cost != cost {
                 println!(
